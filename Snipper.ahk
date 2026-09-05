@@ -51,6 +51,13 @@ Settings_ToolWindow := false			; True to Hide Snips from taskbar
 ;{-----------------------------------------------
 ;
 guiSnips := Map(), SnipVisible := true, Extensions := Array()
+; AI pipeline
+AIJob := {}
+AI_Python := 'python.exe'					; launcher used to run gemini.py
+AI_Timeout := 90000						; ms to wait for gemini.py before giving up
+AI_ImageFile := A_ScriptDir '\image.png'		; absolute, so the working dir cannot matter
+AI_ResponseFile := A_ScriptDir '\response.txt'
+AI_DoneFile := A_ScriptDir '\response.done'
 ;}
 
 ;; #INCLUDE EXTENSION
@@ -112,15 +119,14 @@ Try DllCall("SetThreadDpiAwarenessContext", "ptr", -3, "ptr")
 ;; HOTKEYS
 ;{-----------------------------------------------
 ;
-#Lbutton::		;	<-- Snip Image Only
+#Lbutton::		;	<-- AI Snip: transcribe to clipboard (nothing left on screen)
 {
-	Global guiSnips
 	Area := SelectScreenRegion('LButton')
 	If (Area.W > 8 and Area.H > 8)
-		SnipArea(Area, false, true, SnipVisible, &guiSnips)
+		AI_Snip(Area)
 }
 
-#^Lbutton::	;	<-- Snip Image and Copy to Clipboard
+#^Lbutton::	;	<-- Snip Image and Copy Image to Clipboard
 {
 	Global guiSnips
 	Area := SelectScreenRegion('LButton')
@@ -128,7 +134,7 @@ Try DllCall("SetThreadDpiAwarenessContext", "ptr", -3, "ptr")
 		SnipArea(Area, true, true, SnipVisible, &guiSnips)
 }
 
-#!Lbutton::	;	<-- Copy to Clipboard Only
+#!Lbutton::	;	<-- Copy Image to Clipboard Only
 {
 	Area := SelectScreenRegion('LButton')
 	SnipArea(Area, true, false)
@@ -166,6 +172,215 @@ Esc:: CloseSnip()	;	<-- @@ Close Active Snip
 #HotIf
 
 ;}
+
+;; AI PIPELINE
+;{-----------------------------------------------
+;
+; Snip -> image.png -> gemini.py -> response.txt -> clipboard.
+;
+; gemini.py is the only writer of response.txt and response.done.  It writes
+; both atomically (temp file + replace) and always writes response.done last,
+; so waiting on that marker - rather than watching response.txt change - is
+; what makes this reliable:
+;
+;   * a half-written response.txt can never be read (that produced the
+;     truncated and empty pastes)
+;   * an answer identical to the previous one is still detected (that hung the
+;     old wait loop forever, leaving the snip stuck on screen)
+;   * a gemini.py that dies, or never starts, is reported instead of waited on
+;
+; The wait is a timer, not a Sleep loop, so the hotkey thread never blocks.
+;
+AI_Snip(Area)
+{
+	Global AIJob
+
+	; A run in flight is stale the moment a new snip is taken.
+	If AIJob.HasProp('PID')
+	{
+		Try ProcessClose(AIJob.PID)
+		AIJob.DeleteProp('PID')
+	}
+	SetTimer(AI_Poll, 0)
+
+	; Capture straight to disk.  No snip window is created, so there is nothing
+	; left on screen to clean up if anything below fails.
+	GDIp.Startup()
+	pBitmap := GDIp.BitmapFromScreen(Area)
+	Saved := GDIp.SaveBitmapToFile(pBitmap, AI_ImageFile)
+	GDIp.DisposeImage(pBitmap)
+	GDIp.Shutdown()
+	If Saved != 0
+	{
+		AI_Status('err', 'Could not save the snip (' Saved ')', Area)
+		Return
+	}
+
+	Try FileDelete(AI_DoneFile)
+	If FileExist(AI_DoneFile)
+	{
+		AI_Status('err', 'response.done is locked', Area)
+		Return
+	}
+
+	Try
+		Run('"' AI_Python '" "' A_ScriptDir '\gemini.py"', A_ScriptDir, 'Hide', &PID)
+	Catch
+	{
+		AI_Status('err', 'Cannot start ' AI_Python, Area)
+		Return
+	}
+
+	AIJob := { PID: PID, Area: Area, Deadline: A_TickCount + AI_Timeout, Grace: 0 }
+	AI_Status('work', 'Reading snip', Area)
+	SetTimer(AI_Poll, 50)
+}
+
+AI_Poll()
+{
+	Global AIJob
+	If !AIJob.HasProp('PID')
+	{
+		SetTimer(, 0)
+		Return
+	}
+	If FileExist(AI_DoneFile)
+	{
+		SetTimer(, 0)
+		AI_Finish()
+		Return
+	}
+	If !ProcessExist(AIJob.PID)
+	{
+		; python can exit a hair before the marker becomes visible to us
+		If (AIJob.Grace += 1) < 10
+			Return
+		SetTimer(, 0)
+		Area := AIJob.Area, AIJob.DeleteProp('PID')
+		AI_Status('err', 'gemini.py exited without a result', Area)
+		Return
+	}
+	If (A_TickCount > AIJob.Deadline)
+	{
+		SetTimer(, 0)
+		Try ProcessClose(AIJob.PID)
+		Area := AIJob.Area, AIJob.DeleteProp('PID')
+		AI_Status('err', 'Timed out after ' Round(AI_Timeout / 1000) 's', Area)
+	}
+}
+
+AI_Finish()
+{
+	Global AIJob
+	Area := AIJob.Area
+	AIJob.DeleteProp('PID')
+
+	Status := ''
+	Try Status := Trim(FileRead(AI_DoneFile, 'UTF-8'), ' `t`r`n')
+	If SubStr(Status, 1, 2) != 'OK'
+	{
+		AI_Status('err', Status ? Status : 'gemini.py reported no status', Area)
+		Return
+	}
+
+	Text := ''
+	Try Text := FileRead(AI_ResponseFile, 'UTF-8')
+	If Trim(Text, ' `t`r`n') = ''
+	{
+		AI_Status('err', 'Transcription was empty', Area)
+		Return
+	}
+	If !AI_SetClipboard(Text)
+	{
+		AI_Status('err', 'Clipboard is locked by another app', Area)
+		Return
+	}
+	AI_Status('ok', StrLen(Text) ' chars', Area)
+}
+
+;{ AI_SetClipboard
+; Another app can hold the clipboard open, so set it, read it back, retry.
+AI_SetClipboard(Text)
+{
+	Loop 20
+	{
+		Try
+		{
+			A_Clipboard := Text
+			If (A_Clipboard == Text)
+				Return true
+		}
+		Sleep 25
+	}
+	Return false
+}
+;}
+;{ AI_Status - the on-screen indicator
+; A small click-through banner just below the snip that never takes focus.
+; States: 'work' (amber, animated), 'ok' (green), 'err' (red), 'hide'.
+AI_Status(State, Msg := '', Area?)
+{
+	Static G := 0, Dot := 0, Label := 0, W := 0, H := 0, Base := '', Step := 0
+
+	If !G
+	{
+		G := Gui('-Caption +AlwaysOnTop +ToolWindow -DPIScale +E0x08000000 +E0x20', 'AISnipperStatus')
+		G.BackColor := 0x17171B
+		G.MarginX := 14, G.MarginY := 11
+		G.SetFont('s10 q5', 'Segoe UI')
+		Dot := G.Add('Text', 'w10 h10 y15 Background808080')
+		Label := G.Add('Text', 'x+10 yp-4 w250 cWhite', '')
+		G.Show('Hide AutoSize NoActivate')
+		G.GetPos(, , &W, &H)
+	}
+
+	Switch State
+	{
+		Case 'work':
+			Base := Msg, Step := 0
+			Dot.Opt('BackgroundFFB020'), Dot.Redraw()
+			Label.SetFont('cD8D8DE'), Label.Text := Base '...'
+			AI_Place(G, W, H, Area?)
+			SetTimer(AI_Tick, 320)
+		Case 'tick':
+			Step := Mod(Step, 3) + 1
+			Label.Text := Base SubStr('...', 1, Step)
+		Case 'ok':
+			SetTimer(AI_Tick, 0)
+			Dot.Opt('Background3FC97A'), Dot.Redraw()
+			Label.SetFont('c9BE8B8'), Label.Text := 'Copied to clipboard  -  ' Msg
+			AI_Place(G, W, H, Area?)
+			SetTimer(AI_Hide, -1600)
+		Case 'err':
+			SetTimer(AI_Tick, 0)
+			Dot.Opt('BackgroundE05252'), Dot.Redraw()
+			Label.SetFont('cFFA0A0'), Label.Text := 'Failed  -  ' (StrLen(Msg) > 60 ? SubStr(Msg, 1, 57) '...' : Msg)
+			AI_Place(G, W, H, Area?)
+			SetTimer(AI_Hide, -6000)
+		Case 'hide':
+			SetTimer(AI_Tick, 0)
+			G.Hide()
+	}
+}
+
+AI_Tick() => AI_Status('tick')
+AI_Hide() => AI_Status('hide')
+
+; Anchor under the bottom-right of the snip, kept inside the virtual desktop.
+AI_Place(G, W, H, Area?)
+{
+	Static X := 0, Y := 0
+	If IsSet(Area)
+	{
+		VX := SysGet(76), VY := SysGet(77), VW := SysGet(78), VH := SysGet(79)
+		X := MinMax(Area.X + Area.W - W, VX + 10, VX + VW - W - 10)
+		Y := MinMax(Area.Y + Area.H + 14, VY + 10, VY + VH - H - 10)
+	}
+	G.Show('NoActivate x' X ' y' Y ' w' W ' h' H)
+}
+;}
+;}
+
 
 ;; CLASSES & FUNCTIONS - GUI
 ;{-----------------------------------------------
@@ -527,21 +742,7 @@ SnipArea(Area, SetClipboard := false, CreateWindow := true, ShowWindow := true, 
 			guiObj.Show('NA x' Area.X - 3 ' y' Area.Y - 3)
 		Else
 			guiObj.Show('Hide x' Area.X - 3 ' y' Area.Y - 3)
-		GDIp.DisposeImage(pBitmap)
 		GDIp.DeleteObject(hBitmap)
-		Snip2File(false, Settings_SavePath_Image, 'Snip_' A_Now, Settings_SavePath_Image_Ext, guiObj.hwnd, Settings_Image_Quality)
-		; --- run your Gemini pipeline after the snip ---
-		Run('python.exe "' A_ScriptDir '\gemini.py', '', 'Hide')
-		origRead := FileRead(A_ScriptDir . "\response.txt")
-		Loop {
-			Sleep 20
-			newRead := FileRead(A_ScriptDir . "\response.txt")
-			if origRead != newRead
-				break
-		}
-		Response := newRead
-		A_Clipboard := Response
-		CloseSnip(guiObj.hwnd)
 	}
 	GDIp.DisposeImage(pBitmap)
 	GDIp.Shutdown()
@@ -603,12 +804,11 @@ Snip2File(Borders := false, SavePath?, FileNameOnly?, FileExt?, Hwnd?, Quality?)
 		}
 		Else
 			pBitmap := GDIp.BitmapFromHWND(Hwnd)
-		FileName := 'image.png'
-		; TimeStamp := FormatTime(, 'yyyy_MM_dd @ HH_mm_ss')
-		; If IsSet(FileNameOnly)
-		; 	FileName := FileNameOnly '.' FileExt
-		; Else
-		; 	FileName := TimeStamp ' (' guiSnips[Hwnd].Area.W + 6 'x' guiSnips[Hwnd].Area.H + 6 ').' FileExt
+		TimeStamp := FormatTime(, 'yyyy_MM_dd @ HH_mm_ss')
+		If IsSet(FileNameOnly)
+			FileName := FileNameOnly '.' FileExt
+		Else
+			FileName := TimeStamp ' (' guiSnips[Hwnd].Area.W + 6 'x' guiSnips[Hwnd].Area.H + 6 ').' FileExt
 		GDIp.SaveBitmapToFile(pBitmap, SavePath FileName, Quality)
 		GDIp.DisposeImage(pBitmap)
 		GDIp.Shutdown()
@@ -616,8 +816,10 @@ Snip2File(Borders := false, SavePath?, FileNameOnly?, FileExt?, Hwnd?, Quality?)
 	Else
 	{
 		TimeStamp := FormatTime(, 'yyyy_MM_dd @ HH_mm_ss')
-		; FileName := TimeStamp ' (' guiSnips[Hwnd].Area.W 'x' guiSnips[Hwnd].Area.H ').' FileExt
-		FileName := 'image.png'
+		If IsSet(FileNameOnly)
+			FileName := FileNameOnly '.' FileExt
+		Else
+			FileName := TimeStamp ' (' guiSnips[Hwnd].Area.W 'x' guiSnips[Hwnd].Area.H ').' FileExt
 		hBitMap := SendMessage(0x173, 0, 0, guiSnips[Hwnd].GuiObj.Pic)
 		GDIp.Startup()
 		pBitmap := GDIp.CreateBitmapFromHBITMAP(hBitMap)
